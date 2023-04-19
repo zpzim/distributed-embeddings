@@ -46,6 +46,30 @@ def gen_power_law_data(batch_size, hotness, num_rows, alpha):
 
 
 # pylint: enable=missing-type-doc
+def generate_cat_input(batch_size, max_hotness, min_hotness, mean_hotness, num_rows, alpha):
+  if max_hotness == min_hotness:
+    if alpha == 0:
+      return max_hotness * batch_size, tf.random.uniform(shape=[max_hotness, batch_size], maxval=num_rows, dtype=tf.int64)
+    return max_hotness * batch_size, gen_power_law_data(batch_size, max_hotness, num_rows, alpha)
+
+  rng = np.random.default_rng()
+  n = max_hotness - min_hotness
+  p = (mean_hotness - min_hotness) / n
+  batch_lengths = rng.binomial(n, p, batch_size) + min_hotness
+  total_elems = np.sum(batch_lengths)
+  # Do not generate an empty batch.
+  if total_elems == 0:
+   batch_lengths[0] = 1
+   total_elems += 1
+  if alpha == 0:
+    values = tf.random.uniform(shape=[total_elems],
+                                    maxval=num_rows,
+                                    dtype=tf.int64)
+  else:
+    values = power_law(1, num_rows + 1, alpha, np.random.rand(total_elems)) - 1
+  return total_elems, tf.RaggedTensor.from_row_lengths(values=values, row_lengths=batch_lengths)
+
+# pylint: enable=missing-type-doc
 
 
 class InputGenerator(keras.utils.Sequence):
@@ -66,7 +90,8 @@ class InputGenerator(keras.utils.Sequence):
                alpha=0,
                mp_input_ids=None,
                num_batches=10,
-               embedding_device='/GPU:0'):
+               embedding_device='/GPU:0',
+               mean_hotness_ratio=1.0):
     self.dp_batch_size = global_batch_size // hvd.size()
     self.cat_batch_size = global_batch_size if mp_input_ids is not None else self.dp_batch_size
     self.num_batches = num_batches
@@ -84,20 +109,24 @@ class InputGenerator(keras.utils.Sequence):
                  embed_count)
 
     self.input_pool = []
+    total_cat_elems_generated = 0
     for _ in range(num_batches):
       cat_features = []
       input_ids = mp_input_ids if mp_input_ids is not None else list(range(input_count))
       for input_id in input_ids:
         hotness, num_rows = global_input_shapes[input_id]
         with tf.device(embedding_device):
-          if alpha == 0:
-            cat_features.append(
-                tf.random.uniform(shape=[self.cat_batch_size, hotness],
-                                  maxval=num_rows,
-                                  dtype=tf.int64))
+          max_hotness = hotness
+          if mean_hotness_ratio < 1:
+            min_hotness = 0
+            mean_hotness = hotness * mean_hotness_ratio 
           else:
-            cat_features.append(gen_power_law_data(self.cat_batch_size, hotness, num_rows, alpha))
-
+            min_hotness = hotness
+            mean_hotness = hotness
+          print(mean_hotness_ratio, max_hotness, min_hotness, mean_hotness)
+          cat_elems_generated, data = generate_cat_input(self.cat_batch_size, max_hotness, min_hotness, mean_hotness, num_rows, alpha)
+          total_cat_elems_generated += cat_elems_generated
+          cat_features.append(data)
           numerical_features = tf.random.uniform(
               shape=[self.dp_batch_size, model_config.num_numerical_features],
               maxval=100,
@@ -105,6 +134,7 @@ class InputGenerator(keras.utils.Sequence):
           labels = tf.random.uniform(shape=[self.dp_batch_size, 1], maxval=2, dtype=tf.int32)
 
       self.input_pool.append(((numerical_features, cat_features), labels))
+    logging.info('Generated %d categorical lookup ids for %d batches. Avg of %f ids per sample', total_cat_elems_generated, num_batches, total_cat_elems_generated / num_batches / self.cat_batch_size) 
 
   def __len__(self):
     return self.num_batches
