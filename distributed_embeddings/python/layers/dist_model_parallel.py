@@ -19,6 +19,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import initializers
 from tensorflow.python.keras.utils import tf_utils
+from tensorflow.python.ops.ragged import ragged_tensor
 import horovod
 import horovod.tensorflow as hvd
 import horovod.tensorflow.keras as hvd_keras
@@ -398,6 +399,109 @@ class DistributedEmbedding(tf.keras.layers.Layer):
         for offset in self.strategy.local_input_offsets[self.rank]
     ]
 
+  def _dp_to_mp_ragged(self, inputs):
+    local_shapes, local_splits, global_splits, flat_inputs = [], [], [], []
+    global_splits_values = []
+    global_splits_lengths = []
+    local_splits_values = []
+    local_splits_lengths = []
+    flat_rank_values = []
+    flat_row_splits = []
+    # Construct the local portion of the mp-input for each rank.
+    for rank_input_ids in self.strategy.input_ids_list:
+      rank_values = [inputs[index].values for index in rank_input_ids]
+      rank_row_splits = [inputs[index].row_splits for index in rank_input_ids]
+      local_splits_values.append([len(elems) for elems in rank_values])
+      local_splits_lengths.append([len(elems) for elems in rank_row_splits])
+      global_splits_values.append(sum(local_splits_values[-1]))
+      global_splits_lengths.append(sum(local_splits_lengths[-1]))
+      # For ragged input, we need to split the tensor into its CSR component values and row_splits.
+      flat_rank_values += rank_values
+      flat_row_splits += rank_row_splits
+    if self.rank == 0:
+      print('Strategy: ' , self.strategy.input_ids_list)
+      print('Local Splits Values: ', local_splits_values)
+      print('Local Splits Lengths: ', local_splits_lengths)
+      print('Global Splits Values: ', global_splits_values)
+      print('Global Splits Lengths: ', global_splits_lengths)
+      print('Flat Rank values shape: ', [item.shape for item in flat_rank_values])
+      print('Flat row lengths shape: ', [item.shape for item in flat_row_splits])
+    # Concatentate local mp-input across all ranks, for ragged input this includes both values and row_splits. Requiring 2x all-to-all.
+    concat_values = tf.concat(flat_rank_values, 0)
+    if self.rank == 0:
+      print(f'Rank {self.rank} values shape: {concat_values.shape}')
+    concat_values, values_gathered = hvd.alltoall(concat_values, splits=global_splits_values, name='inp_dp_to_mp_values')
+    if self.rank == 0:
+      print(f'Rank {self.rank} values after alltoall shape: {concat_values.shape}')
+    concat_splits = tf.concat(flat_row_splits, 0)
+    if self.rank == 0:
+      print(f'Rank {self.rank} splits shape: {concat_splits.shape}')
+    concat_splits, splits_gathered = hvd.alltoall(concat_splits, splits=global_splits_lengths, name='inp_dp_to_mp_lengths')
+    if self.rank == 0:
+      print(f'Rank {self.rank} splits after alltoall shape: {concat_splits.shape}')
+      print(f'Rank {self.rank} split points: {local_splits_values}')
+    concat_local_splits = tf.concat(local_splits_values, 0)
+
+    # We also need to transfer the split points for each feature in the concatenated mp input, since the length of each is variable depending on hotness of each input.
+    # Requires an additional small all-to-all.
+    if self.rank == 0:
+      print(f'Rank {self.rank} concat_local_splits shape: {concat_local_splits.shape}')
+    split_points = [len(split) for split in local_splits_values]
+    if self.rank == 0:
+      print(f'Rank {self.rank} local split point splits: {split_points}') 
+    splits, _ = hvd.alltoall(concat_local_splits, splits=split_points, name='inp_dp_to_mp_splits')
+    if self.rank == 0:
+      print(f'Rank {self.rank} splits shape: {splits.shape}')
+
+    local_splits = tf.reshape(splits, [self.world_size, -1])
+    if self.rank == 0:
+      print(f'Rank {self.rank} got splits after alltoall: {local_splits}') 
+     
+    # Resplit the locally gathered mp input received from each rank. Both values and row_splits must be split back up.
+    values = tf.split(concat_values, values_gathered, 0)
+    if self.rank == 0:
+      for i, elem in enumerate(values):
+          print(f'Values split: {i} shape = {elem.shape}')
+    row_splits = tf.split(concat_splits, splits_gathered, 0)
+    if self.rank == 0:
+      for i, elem in enumerate(row_splits):
+          print(f'Row split: {i} shape = {elem.shape}')
+      print(f'local_splits = {local_splits}')
+    # Further split each of the inputs by feature and re-concatenate all the input from each feature back together to construct the final model parallel input.
+    reconstructed_feat_values = [tf.split(inp, num_or_size_splits=local_splits[rank], num=len(self.strategy.input_ids_list[self.rank]), axis=0) for rank, inp in enumerate(values)]
+    reconstructed_feat_splits = [tf.split(inp, len(self.strategy.input_ids_list[self.rank]), 0) for rank, inp in enumerate(row_splits)]
+    inputs = []
+    reconstructed_input = {}
+    for rank in range(self.world_size):
+      for feat, (vals, splits) in enumerate(zip(reconstructed_feat_values[rank], reconstructed_feat_splits[rank])):
+        if feat not in reconstructed_input:
+          reconstructed_input[feat] = []
+        reconstructed_input[feat].append(tf.RaggedTensor.from_row_splits(values=vals, row_splits=splits, validate=False))
+    for elems in reconstructed_input.values():
+      inputs.append(tf.concat(elems, 0))
+    return inputs
+  
+  def _dp_to_mp_dense(self, inputs):
+    local_shapes, local_splits, global_splits, flat_inputs = [], [], [], []
+    # Construct the local portion of the mp-input for each rank.
+    for rank_input_ids in self.strategy.input_ids_list:
+       rank_inputs = [inputs[index] for index in rank_input_ids]
+       local_shapes.append([_get_shape(inp) for inp in rank_inputs])
+       rank_inputs = [tf.reshape(inp, [-1]) for inp in rank_inputs]
+       local_splits.append([_get_shape(inp)[0] for inp in rank_inputs])
+       global_splits.append(sum(local_splits[-1]))
+       flat_inputs += rank_inputs
+    inputs = tf.concat(flat_inputs, 0)
+    inputs, _ = hvd.alltoall(inputs, splits=global_splits, name='inp_dp_to_mp')
+    inputs = tf.reshape(inputs, [self.world_size, -1])
+    inputs = tf.split(inputs, local_splits[self.rank], 1)
+    inputs = [
+        tf.reshape(inp, tf.concat([[self.world_size * shape[0]], shape[1:]], 0))
+        for inp, shape in zip(inputs, local_shapes[self.rank])
+    ]
+    return inputs
+ 
+
   def _call_base(self, inputs):  # pylint: disable=missing-param-doc,missing-type-doc
     """Call function that do embeddings and communication
 
@@ -411,85 +515,10 @@ class DistributedEmbedding(tf.keras.layers.Layer):
           if inp.dtype == tf.int64:
             comm_dtype = tf.int64
         inputs = [tf.cast(inp, comm_dtype) for inp in inputs]
-        local_shapes, local_splits, global_splits, flat_inputs = [], [], [], []
-        global_splits_values = []
-        global_splits_lengths = []
-        local_splits_values = []
-        local_splits_lengths = []
-        flat_rank_values = []
-        flat_row_splits = []
-        # Construct the local portion of the mp-input for each rank.
-        for rank_input_ids in self.strategy.input_ids_list:
-          rank_values = [inputs[index].values for index in rank_input_ids]
-          rank_row_splits = [inputs[index].row_splits for index in rank_input_ids]
-          local_splits_values.append([len(elems) for elems in rank_values])
-          local_splits_lengths.append([len(elems) for elems in rank_row_splits])
-          global_splits_values.append(sum(local_splits_values[-1]))
-          global_splits_lengths.append(sum(local_splits_lengths[-1]))
-          # For ragged input, we need to split the tensor into its CSR component values and row_splits.
-          flat_rank_values += rank_values
-          flat_row_splits += rank_row_splits
-        if self.rank == 0:
-          print('Strategy: ' , self.strategy.input_ids_list)
-          print('Local Splits Values: ', local_splits_values)
-          print('Local Splits Lengths: ', local_splits_lengths)
-          print('Global Splits Values: ', global_splits_values)
-          print('Global Splits Lengths: ', global_splits_lengths)
-          print('Flat Rank values shape: ', [item.shape for item in flat_rank_values])
-          print('Flat row lengths shape: ', [item.shape for item in flat_row_splits])
-        # Concatentate local mp-input across all ranks, for ragged input this includes both values and row_splits. Requiring 2x all-to-all.
-        concat_values = tf.concat(flat_rank_values, 0)
-        if self.rank == 0:
-          print(f'Rank {self.rank} values shape: {concat_values.shape}')
-        concat_values, values_gathered = hvd.alltoall(concat_values, splits=global_splits_values, name='inp_dp_to_mp_values')
-        if self.rank == 0:
-          print(f'Rank {self.rank} values after alltoall shape: {concat_values.shape}')
-        concat_splits = tf.concat(flat_row_splits, 0)
-        if self.rank == 0:
-          print(f'Rank {self.rank} splits shape: {concat_splits.shape}')
-        concat_splits, splits_gathered = hvd.alltoall(concat_splits, splits=global_splits_lengths, name='inp_dp_to_mp_lengths')
-        if self.rank == 0:
-          print(f'Rank {self.rank} splits after alltoall shape: {concat_splits.shape}')
-          print(f'Rank {self.rank} split points: {local_splits_values}')
-        concat_local_splits = tf.concat(local_splits_values, 0)
-
-        # We also need to transfer the split points for each feature in the concatenated mp input, since the length of each is variable depending on hotness of each input.
-        # Requires an additional small all-to-all.
-        if self.rank == 0:
-          print(f'Rank {self.rank} concat_local_splits shape: {concat_local_splits.shape}')
-        split_points = [len(split) for split in local_splits_values]
-        if self.rank == 0:
-          print(f'Rank {self.rank} local split point splits: {split_points}') 
-        splits, _ = hvd.alltoall(concat_local_splits, splits=split_points, name='inp_dp_to_mp_splits')
-        if self.rank == 0:
-          print(f'Rank {self.rank} splits shape: {splits.shape}')
-
-        local_splits = tf.reshape(splits, [self.world_size, -1])
-        if self.rank == 0:
-          print(f'Rank {self.rank} got splits after alltoall: {local_splits}') 
-         
-        # Resplit the locally gathered mp input received from each rank. Both values and row_splits must be split back up.
-        values = tf.split(concat_values, values_gathered, 0)
-        if self.rank == 0:
-          for i, elem in enumerate(values):
-              print(f'Values split: {i} shape = {elem.shape}')
-        row_splits = tf.split(concat_splits, splits_gathered, 0)
-        if self.rank == 0:
-          for i, elem in enumerate(row_splits):
-              print(f'Row split: {i} shape = {elem.shape}')
-          print(f'local_splits = {local_splits}')
-        # Further split each of the inputs by feature and re-concatenate all the input from each feature back together to construct the final model parallel input.
-        reconstructed_feat_values = [tf.split(inp, num_or_size_splits=local_splits[rank], num=len(self.strategy.input_ids_list[self.rank]), axis=0) for rank, inp in enumerate(values)]
-        reconstructed_feat_splits = [tf.split(inp, len(self.strategy.input_ids_list[self.rank]), 0) for rank, inp in enumerate(row_splits)]
-        inputs = []
-        reconstructed_input = {}
-        for rank in range(self.world_size):
-          for feat, (vals, splits) in enumerate(zip(reconstructed_feat_values[rank], reconstructed_feat_splits[rank])):
-            if feat not in reconstructed_input:
-              reconstructed_input[feat] = []
-            reconstructed_input[feat].append(tf.RaggedTensor.from_row_splits(values=vals, row_splits=splits, validate=False))
-        for elems in reconstructed_input.values():
-          inputs.append(tf.concat(elems, 0))
+        if isinstance(inputs[0], ragged_tensor.RaggedTensor):
+          inputs = self._dp_to_mp_ragged(inputs)
+        else:
+          inputs = self._dp_to_mp_dense(inputs)
       else:
         # expected input order may still change in case of single process
         inputs = [inputs[idx] for idx in self.strategy.input_ids_list[0]]
