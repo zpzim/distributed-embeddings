@@ -26,6 +26,8 @@ import horovod.tensorflow as hvd
 from distributed_embeddings.python.layers.embedding import Embedding
 from distributed_embeddings.python.layers import dist_model_parallel as dmp
 
+tf.random.set_seed(12345)
+rng = np.random.default_rng(12345)
 
 # pylint: disable=missing-type-doc
 def power_law(k_min, k_max, alpha, r):
@@ -52,7 +54,6 @@ def generate_cat_input(batch_size, max_hotness, min_hotness, mean_hotness, num_r
       return max_hotness * batch_size, tf.random.uniform(shape=[max_hotness, batch_size], maxval=num_rows, dtype=tf.int64)
     return max_hotness * batch_size, gen_power_law_data(batch_size, max_hotness, num_rows, alpha)
 
-  rng = np.random.default_rng()
   n = max_hotness - min_hotness
   p = (mean_hotness - min_hotness) / n
   batch_lengths = rng.binomial(n, p, batch_size) + min_hotness
