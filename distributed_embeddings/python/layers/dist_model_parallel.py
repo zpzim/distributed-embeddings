@@ -399,7 +399,60 @@ class DistributedEmbedding(tf.keras.layers.Layer):
         for offset in self.strategy.local_input_offsets[self.rank]
     ]
 
+  @tf.function(jit_compile=True)
+  def _ragged_concat(self, batch_size, splits, values_gathered, concat_values, concat_splits):
+    num_features = len(self.strategy.input_ids_list[self.rank])
+
+    # Split point correction. 
+    # f# - a batch_size chunk of split points corresponding to a particular feature which has lookup ids on an embedding table located on this device.
+    # d# - the source device for this data
+    # Since we have concatenated many features together, and then received this data from many devices, we have a flat tensor which looks like the following:
+    # [d0f0, d0f2, d0f3, d1f0, d1f2, d1f3, d2f0, d2f2, d2f3]
+    # We want to format the data into our intputs like this:
+    # [d0f0, d1f0, d2f0, ...], [d0f2, d1f2, d2f2, ...], [d0f3, d1f3, d2f3, ...]
+    # This requires splitting the data into individual batches of each feature from each device, then reconstructing the correct feature input.
+    # We need to correct the split points so that if we split then reconcat the values like above, then we'd have a valid RaggedTensor:
+    local_corrections = tf.concat([tf.zeros([1, num_features], dtype=tf.int32), tf.reshape(splits, [self.world_size, num_features])[:-1,:]], 0)
+    local_corrections = tf.math.cumsum(local_corrections, axis=0)
+    local_corrections = tf.expand_dims(local_corrections, -1)
+    concat_splits = tf.reshape(tf.reshape(concat_splits, [self.world_size, num_features, batch_size+1]) + tf.cast(local_corrections, tf.int64), [-1])
+
+    # Split up the lookup ids corresponding the split points for each feature on each device.
+    split_values = tf.split(concat_values, splits, num=self.world_size*num_features)
+    # Since the splits are always batch_size elements, we can simply break them up without specifying any splits.
+    split_splits = tf.split(concat_splits, num_features * self.world_size)
+
+    # Now reconstruct the global_batch_size input for each feature.
+    feature_values = [[] for _ in range(num_features)]
+    for i, tensor in enumerate(split_values):
+      feature_values[i % num_features].append(tensor)
+
+    concat_feature_values = []
+    for elem in feature_values:
+      concat_feature_values.append(tf.concat(elem, 0))
+
+    feature_splits = [[] for _ in range(num_features)]
+    for i, tensor in enumerate(split_splits):
+      # Each feature's splits tensor contains an extra element denoting the number of values in the RaggedTensor at the end, this is no longer the correct value and we need to remove it.
+      feature_splits[i % num_features].append(tensor[:-1])
+
+    # The last element of each ragged tensor's splits contains the number of values in the flattened tensor. We need to compute that value to insert it at the end.
+    values_gathered_per_feature = tf.cast(tf.math.reduce_sum(tf.reshape(splits, [self.world_size, num_features]), axis=0), tf.int64)
+    
+    concat_feature_splits = []
+    for i in range(num_features):
+      feature_splits[i].append(tf.reshape(values_gathered_per_feature[i], [1]))
+      concat_feature_splits.append(tf.concat(feature_splits[i], 0))
+
+    # Reconstruct the ragged tensor from the component tensors we reconstructed.
+    output = []
+    for value, split in zip(concat_feature_values, concat_feature_splits):
+      output.append(tf.RaggedTensor.from_row_splits(values=value, row_splits=split, validate=False))
+    return output
+
   def _dp_to_mp_ragged(self, inputs):
+    batch_size = tf.shape(
+        inputs[0], out_type=tf.int32)[0] if inputs[0].shape[0] is None else inputs[0].shape[0]
     local_shapes, local_splits, global_splits, flat_inputs = [], [], [], []
     global_splits_values = []
     global_splits_lengths = []
@@ -428,59 +481,18 @@ class DistributedEmbedding(tf.keras.layers.Layer):
       print('Flat row lengths shape: ', [item.shape for item in flat_row_splits])
     # Concatentate local mp-input across all ranks, for ragged input this includes both values and row_splits. Requiring 2x all-to-all.
     concat_values = tf.concat(flat_rank_values, 0)
-    if self.rank == 0:
-      print(f'Rank {self.rank} values shape: {concat_values.shape}')
     concat_values, values_gathered = hvd.alltoall(concat_values, splits=global_splits_values, name='inp_dp_to_mp_values')
-    if self.rank == 0:
-      print(f'Rank {self.rank} values after alltoall shape: {concat_values.shape}')
     concat_splits = tf.concat(flat_row_splits, 0)
-    if self.rank == 0:
-      print(f'Rank {self.rank} splits shape: {concat_splits.shape}')
-    concat_splits, splits_gathered = hvd.alltoall(concat_splits, splits=global_splits_lengths, name='inp_dp_to_mp_lengths')
-    if self.rank == 0:
-      print(f'Rank {self.rank} splits after alltoall shape: {concat_splits.shape}')
-      print(f'Rank {self.rank} split points: {local_splits_values}')
-    concat_local_splits = tf.concat(local_splits_values, 0)
+    concat_splits, _ = hvd.alltoall(concat_splits, splits=global_splits_lengths, name='inp_dp_to_mp_lengths')
 
     # We also need to transfer the split points for each feature in the concatenated mp input, since the length of each is variable depending on hotness of each input.
     # Requires an additional small all-to-all.
-    if self.rank == 0:
-      print(f'Rank {self.rank} concat_local_splits shape: {concat_local_splits.shape}')
     split_points = [len(split) for split in local_splits_values]
-    if self.rank == 0:
-      print(f'Rank {self.rank} local split point splits: {split_points}') 
+    concat_local_splits = tf.concat(local_splits_values, 0)
     splits, _ = hvd.alltoall(concat_local_splits, splits=split_points, name='inp_dp_to_mp_splits')
-    if self.rank == 0:
-      print(f'Rank {self.rank} splits shape: {splits.shape}')
+    # Reconstruct the input from the data we received from all other devices. 
+    return self._ragged_concat(batch_size, splits, values_gathered, concat_values, concat_splits)
 
-    local_splits = tf.reshape(splits, [self.world_size, -1])
-    if self.rank == 0:
-      print(f'Rank {self.rank} got splits after alltoall: {local_splits}') 
-     
-    # Resplit the locally gathered mp input received from each rank. Both values and row_splits must be split back up.
-    values = tf.split(concat_values, values_gathered, 0)
-    if self.rank == 0:
-      for i, elem in enumerate(values):
-          print(f'Values split: {i} shape = {elem.shape}')
-    row_splits = tf.split(concat_splits, splits_gathered, 0)
-    if self.rank == 0:
-      for i, elem in enumerate(row_splits):
-          print(f'Row split: {i} shape = {elem.shape}')
-      print(f'local_splits = {local_splits}')
-    # Further split each of the inputs by feature and re-concatenate all the input from each feature back together to construct the final model parallel input.
-    reconstructed_feat_values = [tf.split(inp, num_or_size_splits=local_splits[rank], num=len(self.strategy.input_ids_list[self.rank]), axis=0) for rank, inp in enumerate(values)]
-    reconstructed_feat_splits = [tf.split(inp, len(self.strategy.input_ids_list[self.rank]), 0) for rank, inp in enumerate(row_splits)]
-    inputs = []
-    reconstructed_input = {}
-    for rank in range(self.world_size):
-      for feat, (vals, splits) in enumerate(zip(reconstructed_feat_values[rank], reconstructed_feat_splits[rank])):
-        if feat not in reconstructed_input:
-          reconstructed_input[feat] = []
-        reconstructed_input[feat].append(tf.RaggedTensor.from_row_splits(values=vals, row_splits=splits, validate=False))
-    for elems in reconstructed_input.values():
-      inputs.append(tf.concat(elems, 0))
-    return inputs
-  
   def _dp_to_mp_dense(self, inputs):
     local_shapes, local_splits, global_splits, flat_inputs = [], [], [], []
     # Construct the local portion of the mp-input for each rank.
