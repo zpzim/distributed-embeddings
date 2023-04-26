@@ -30,33 +30,43 @@ tf.random.set_seed(12345)
 rng = np.random.default_rng(12345)
 
 # pylint: disable=missing-type-doc
-def power_law(k_min, k_max, alpha, r):
+def power_law(k_min, k_max, alpha, r, dtype):
   """convert uniform distribution to power law distribution"""
   gamma = 1 - alpha
   y = pow(r * (pow(k_max, gamma) - pow(k_min, gamma)) + pow(k_min, gamma), 1.0 / gamma)
+  if dtype == 'int32':
+    return y.astype(np.int32)
   return y.astype(np.int64)
 
 
-def gen_power_law_data(batch_size, hotness, num_rows, alpha):
+def gen_power_law_data(batch_size, hotness, num_rows, alpha, dtype):
   """naive power law distribution generator
 
   NOTE: Repetition is allowed in multi hot data.
   TODO(skyw): Add support to disallow repetition
   """
-  y = power_law(1, num_rows + 1, alpha, np.random.rand(batch_size * hotness)) - 1
+  y = power_law(1, num_rows + 1, alpha, np.random.rand(batch_size * hotness), dtype) - 1
   return tf.convert_to_tensor(y.reshape([batch_size, hotness]))
 
 
 # pylint: enable=missing-type-doc
-def generate_cat_input(batch_size, max_hotness, min_hotness, mean_hotness, num_rows, alpha):
+def generate_cat_input(batch_size, max_hotness, min_hotness, mean_hotness, num_rows, alpha, dtype):
+  if dtype == 'int32':
+    tfdtype = tf.int32
+  else:
+    tfdtype = tf.int64
+
   if max_hotness == min_hotness:
     if alpha == 0:
-      return max_hotness * batch_size, tf.random.uniform(shape=[max_hotness, batch_size], maxval=num_rows, dtype=tf.int64)
-    return max_hotness * batch_size, gen_power_law_data(batch_size, max_hotness, num_rows, alpha)
+      return max_hotness * batch_size, tf.random.uniform(shape=[max_hotness, batch_size], maxval=num_rows, dtype=tfdtype)
+    return max_hotness * batch_size, gen_power_law_data(batch_size, max_hotness, num_rows, alpha, dtype)
 
   n = max_hotness - min_hotness
-  p = (mean_hotness - min_hotness) / n
-  batch_lengths = rng.binomial(n, p, batch_size) + min_hotness
+  if n == 0:
+    batch_lengths = [min_hotness for _ in range(batch_size)]
+  else:
+    p = (mean_hotness - min_hotness) / n
+    batch_lengths = rng.binomial(n, p, batch_size) + min_hotness
   total_elems = np.sum(batch_lengths)
   # Do not generate an empty batch.
   if total_elems == 0:
@@ -65,10 +75,12 @@ def generate_cat_input(batch_size, max_hotness, min_hotness, mean_hotness, num_r
   if alpha == 0:
     values = tf.random.uniform(shape=[total_elems],
                                     maxval=num_rows,
-                                    dtype=tf.int64)
+                                    dtype=tfdtype)
   else:
-    values = power_law(1, num_rows + 1, alpha, np.random.rand(total_elems)) - 1
-  return total_elems, tf.RaggedTensor.from_row_lengths(values=values, row_lengths=batch_lengths)
+    values = power_law(1, num_rows + 1, alpha, np.random.rand(total_elems), dtype) - 1
+  batch_lengths = np.insert(batch_lengths, 0, 0)
+  row_splits = np.cumsum(batch_lengths)
+  return total_elems, tf.RaggedTensor.from_row_splits(values=values, row_splits=row_splits, validate=False).with_row_splits_dtype(tfdtype)
 
 # pylint: enable=missing-type-doc
 
@@ -96,6 +108,7 @@ class InputGenerator(keras.utils.Sequence):
     self.dp_batch_size = global_batch_size // hvd.size()
     self.cat_batch_size = global_batch_size if mp_input_ids is not None else self.dp_batch_size
     self.num_batches = num_batches
+    self.dtype = 'int64'
 
     input_count = 0
     embed_count = 0
@@ -119,13 +132,14 @@ class InputGenerator(keras.utils.Sequence):
         with tf.device(embedding_device):
           max_hotness = hotness
           if mean_hotness_ratio < 1:
-            min_hotness = 0
-            mean_hotness = hotness * mean_hotness_ratio 
+            #min_hotness = 0
+            #mean_hotness = hotness * mean_hotness_ratio
+            min_hotness = 1
+            mean_hotness = min_hotness + hotness * mean_hotness_ratio
           else:
             min_hotness = hotness
             mean_hotness = hotness
-          print(mean_hotness_ratio, max_hotness, min_hotness, mean_hotness)
-          cat_elems_generated, data = generate_cat_input(self.cat_batch_size, max_hotness, min_hotness, mean_hotness, num_rows, alpha)
+          cat_elems_generated, data = generate_cat_input(self.cat_batch_size, max_hotness, min_hotness, mean_hotness, num_rows, alpha, self.dtype)
           total_cat_elems_generated += cat_elems_generated
           cat_features.append(data)
           numerical_features = tf.random.uniform(

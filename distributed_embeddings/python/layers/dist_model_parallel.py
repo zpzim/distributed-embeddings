@@ -402,6 +402,7 @@ class DistributedEmbedding(tf.keras.layers.Layer):
   @tf.function(jit_compile=True)
   def _ragged_concat(self, batch_size, splits, values_gathered, concat_values, concat_splits):
     num_features = len(self.strategy.input_ids_list[self.rank])
+    splits_dtype = concat_splits.dtype
 
     # Split point correction. 
     # f# - a batch_size chunk of split points corresponding to a particular feature which has lookup ids on an embedding table located on this device.
@@ -412,10 +413,10 @@ class DistributedEmbedding(tf.keras.layers.Layer):
     # [d0f0, d1f0, d2f0, ...], [d0f2, d1f2, d2f2, ...], [d0f3, d1f3, d2f3, ...]
     # This requires splitting the data into individual batches of each feature from each device, then reconstructing the correct feature input.
     # We need to correct the split points so that if we split then reconcat the values like above, then we'd have a valid RaggedTensor:
-    local_corrections = tf.concat([tf.zeros([1, num_features], dtype=tf.int32), tf.reshape(splits, [self.world_size, num_features])[:-1,:]], 0)
+    local_corrections = tf.concat([tf.zeros([1, num_features], dtype=splits.dtype), tf.reshape(splits, [self.world_size, num_features])[:-1,:]], 0)
     local_corrections = tf.math.cumsum(local_corrections, axis=0)
     local_corrections = tf.expand_dims(local_corrections, -1)
-    concat_splits = tf.reshape(tf.reshape(concat_splits, [self.world_size, num_features, batch_size+1]) + tf.cast(local_corrections, tf.int64), [-1])
+    concat_splits = tf.reshape(tf.reshape(concat_splits, [self.world_size, num_features, batch_size+1]) + tf.cast(local_corrections, splits_dtype), [-1])
 
     # Split up the lookup ids corresponding the split points for each feature on each device.
     split_values = tf.split(concat_values, splits, num=self.world_size*num_features)
@@ -437,7 +438,7 @@ class DistributedEmbedding(tf.keras.layers.Layer):
       feature_splits[i % num_features].append(tensor[:-1])
 
     # The last element of each ragged tensor's splits contains the number of values in the flattened tensor. We need to compute that value to insert it at the end.
-    values_gathered_per_feature = tf.cast(tf.math.reduce_sum(tf.reshape(splits, [self.world_size, num_features]), axis=0), tf.int64)
+    values_gathered_per_feature = tf.cast(tf.math.reduce_sum(tf.reshape(splits, [self.world_size, num_features]), axis=0), dtype=splits_dtype)
     
     concat_feature_splits = []
     for i in range(num_features):

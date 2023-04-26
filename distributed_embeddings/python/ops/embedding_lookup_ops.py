@@ -77,7 +77,8 @@ def embedding_lookup(param, ids, combiner=None):
     if dim_0 == num_input:
       return tf.nn.embedding_lookup(param, ids.values)
     return ops.embedding_lookup_variable_hotness(read_var_no_copy(param), ids.values,
-                                                 tf.cast(ids.row_splits, dtype=ids.values.dtype), combiner)
+                                                 ids.row_splits, combiner)
+
   if isinstance(ids, tf.SparseTensor):
     # sparse is ordered but may not be right-ragged. so we generate offset here
     # avoid d2h copy in eager mode by using sparsetensor's shape directly
