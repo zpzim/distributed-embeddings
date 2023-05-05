@@ -514,6 +514,20 @@ class DistributedEmbedding(tf.keras.layers.Layer):
     ]
     return inputs
  
+  @tf.function(jit_compile=True)
+  def _apply_offsets(self, inputs):
+    def apply_offset(inp, offset):
+      # If input is ragged, directy update the values tensor, relying on
+      # the RaggedTensor API to do the add results in XLA not being able
+      # to jit compile this method.
+      if isinstance(inp, ragged_tensor.RaggedTensor):
+        return inp.with_values(inp.values + tf.cast(offset,inp.dtype))
+      return inp + tf.cast(offset,inp.dtype)
+
+    return [
+        inp if offset is None else apply_offset(inp, offset)
+        for inp, offset in zip(inputs, self.offsets)
+    ]
 
   def _call_base(self, inputs):  # pylint: disable=missing-param-doc,missing-type-doc
     """Call function that do embeddings and communication
@@ -539,12 +553,9 @@ class DistributedEmbedding(tf.keras.layers.Layer):
     if len(inputs) != len(self.strategy.local_maps[self.rank]):
       raise ValueError(F"Expect {self.strategy.local_maps[self.rank]} inputs, got {len(inputs)}.")
 
-    # offset inputs
-    inputs = [
-        inp if offset is None else inp + tf.cast(offset, inp.dtype)
-        for inp, offset in zip(inputs, self.offsets)
-    ]
-    # do embedding
+    # Apply any offsets to the input ids.
+    inputs = self._apply_offsets(inputs)
+    # Do embedding lookups
     mp_outs = [
         self.local_embedding_layers[m](inp)
         for m, inp in zip(self.strategy.local_maps[self.rank], inputs)
