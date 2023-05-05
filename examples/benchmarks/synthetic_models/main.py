@@ -48,6 +48,7 @@ flags.DEFINE_string("embedding_device", "/GPU:0", help="device to place embeddin
 flags.DEFINE_enum("embedding_api", "tfde", ["native", "tfde"], help="embedding to use.")
 flags.DEFINE_bool("amp", False, help="Use mixed precision")
 flags.DEFINE_float("mean_dynamic_hotness_ratio", 1.0, help="For enabling dynamic hot input. Ratio of nnz to set the average hotness of data generated for a particular feature. Set between [0,1]") 
+flags.DEFINE_bool('input_file_fmt_string', None, help='Specifies the format string for the input file path. e.g. data/train_{0}.pkl, If specified uses data from the input file rather than randomly generating.')
 # yapf: enable
 # pylint: enable=line-too-long
 
@@ -87,11 +88,16 @@ def main(_):
     raise ValueError(F"Unknown embedding api {FLAGS.embedding_api}.")
 
   mp_input_ids = None if FLAGS.dp_input else model.embeddings.strategy.input_ids_list[hvd_rank]
+  if FLAGS.input_file_fmt_string:
+    input_filename = FLAGS.input_file_fmt_string.format(hvd_rank)
+  else:
+    input_filename = None
   input_gen = InputGenerator(model_config,
                              FLAGS.batch_size,
                              alpha=FLAGS.alpha,
                              mp_input_ids=mp_input_ids,
                              num_batches=FLAGS.num_data_batches,
+                             input_filename=input_filename,
                              embedding_device=FLAGS.embedding_device,
                              mean_hotness_ratio=FLAGS.mean_dynamic_hotness_ratio)
 

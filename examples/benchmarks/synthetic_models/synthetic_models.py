@@ -97,18 +97,75 @@ class InputGenerator(keras.utils.Sequence):
     embedding_device (string): device to put embedding and inputs on
   """
 
+  def _convert_to_ragged(self, input_data, batch_size, num_batches, num_numerical_features, input_ids):
+      # Duplicate input data until we have enough.
+      while len(input_data) < batch_size * num_batches:
+        input_data.extend(input_data)
+
+      labels = []
+      values = {}
+      lengths = {}
+      dense_values = []
+      for label, dense_lookups, sparse_lookups in input_data:
+        for i, feat in enumerate(sparse_lookups):
+          if i not in values:
+            values[i] = []   
+            lengths[i] = []
+          values[i].extend(feat)
+          lengths[i].append(len(feat))
+        dense_values.append(dense_lookups)
+        labels.extend(label)
+
+      curr_pos = {}
+      curr_batch = 0
+      input_pool = []
+      global_total_elems = 0
+      while (curr_batch + 1) * batch_size <= len(input_data):
+        cat_features = []
+        total_batch_elems = 0
+        for i in input_ids:
+          if i not in curr_pos:
+            curr_pos[i] = 0
+          total_elems = sum(lengths[i][curr_batch*batch_size:(curr_batch+1)*batch_size])
+          total_batch_elems += total_elems
+          cat_features.append(tf.RaggedTensor.from_row_lengths(values=values[i][curr_pos[i]:curr_pos[i]+total_elems], row_lengths=lengths[i][curr_batch*batch_size:(curr_batch+1)*batch_size]))
+          curr_pos[i] += total_elems
+          # For now, randomly generate the dense input.
+          #numerical_features = dense_values[curr_batch*batch_size:(curr_batch+1)*batch_size]
+          numerical_features = tf.random.uniform(
+              shape=[self.dp_batch_size, num_numerical_features],
+              maxval=100,
+              dtype=tf.float32)
+        batch_labels = tf.expand_dims(labels[curr_batch*batch_size:(curr_batch+1)*batch_size], -1)
+        input_pool.append(((numerical_features, cat_features), batch_labels))
+        global_total_elems += total_batch_elems
+        curr_batch += 1
+      print(f'Generated total elems {global_total_elems} for {curr_batch+1} batches of size {batch_size}. Avg {global_total_elems / batch_size / (curr_batch+1)} per sample.')
+      return input_pool
+
   def __init__(self,
                model_config,
                global_batch_size,
                alpha=0,
                mp_input_ids=None,
                num_batches=10,
+               input_filename=None,
                embedding_device='/GPU:0',
                mean_hotness_ratio=1.0):
     self.dp_batch_size = global_batch_size // hvd.size()
     self.cat_batch_size = global_batch_size if mp_input_ids is not None else self.dp_batch_size
     self.num_batches = num_batches
     self.dtype = 'int64'
+
+    if input_filename is not None:
+      with open(input_filename,'rb') as f:
+        input_data = pickle.load(f)
+        input_count = 0
+        for config in model_config.embedding_configs:
+          input_count += len(config.nnz)
+        input_ids = mp_input_ids if mp_input_ids is not None else list(range(input_count))
+        self.input_pool = self._convert_to_ragged(input_data, self.cat_batch_size, num_batches, model_config.num_numerical_features, input_ids)
+      return
 
     input_count = 0
     embed_count = 0
