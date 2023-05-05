@@ -16,10 +16,13 @@
 
 import numpy as np
 
+import pickle
+
 from absl import logging
 
 import tensorflow as tf
 from tensorflow import keras
+import tensorflow_recommenders as tfrs
 
 import horovod.tensorflow as hvd
 
@@ -102,6 +105,11 @@ class InputGenerator(keras.utils.Sequence):
       while len(input_data) < batch_size * num_batches:
         input_data.extend(input_data)
 
+      if self.dtype == 'int64':
+        tfdtype = tf.int64
+      else:
+        tfdtype = tf.int32
+
       labels = []
       values = {}
       lengths = {}
@@ -128,7 +136,8 @@ class InputGenerator(keras.utils.Sequence):
             curr_pos[i] = 0
           total_elems = sum(lengths[i][curr_batch*batch_size:(curr_batch+1)*batch_size])
           total_batch_elems += total_elems
-          cat_features.append(tf.RaggedTensor.from_row_lengths(values=values[i][curr_pos[i]:curr_pos[i]+total_elems], row_lengths=lengths[i][curr_batch*batch_size:(curr_batch+1)*batch_size]))
+          ragged_values = tf.constant(values[i][curr_pos[i]:curr_pos[i]+total_elems], dtype=tfdtype)
+          cat_features.append(tf.RaggedTensor.from_row_lengths(values=ragged_values, row_lengths=lengths[i][curr_batch*batch_size:(curr_batch+1)*batch_size]).with_row_splits_dtype(tfdtype))
           curr_pos[i] += total_elems
           # For now, randomly generate the dense input.
           #numerical_features = dense_values[curr_batch*batch_size:(curr_batch+1)*batch_size]

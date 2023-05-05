@@ -48,7 +48,7 @@ flags.DEFINE_string("embedding_device", "/GPU:0", help="device to place embeddin
 flags.DEFINE_enum("embedding_api", "tfde", ["native", "tfde"], help="embedding to use.")
 flags.DEFINE_bool("amp", False, help="Use mixed precision")
 flags.DEFINE_float("mean_dynamic_hotness_ratio", 1.0, help="For enabling dynamic hot input. Ratio of nnz to set the average hotness of data generated for a particular feature. Set between [0,1]") 
-flags.DEFINE_bool('input_file_fmt_string', None, help='Specifies the format string for the input file path. e.g. data/train_{0}.pkl, If specified uses data from the input file rather than randomly generating.')
+flags.DEFINE_string('input_file_fmt_string', None, help='Specifies the format string for the input file path. e.g. data/train_{0}.pkl, If specified uses data from the input file rather than randomly generating.')
 # yapf: enable
 # pylint: enable=line-too-long
 
@@ -89,6 +89,8 @@ def main(_):
 
   mp_input_ids = None if FLAGS.dp_input else model.embeddings.strategy.input_ids_list[hvd_rank]
   if FLAGS.input_file_fmt_string:
+    if not FLAGS.dp_input:
+      raise ValueError("Model parallel inputs are not supported with a custom input file.")
     input_filename = FLAGS.input_file_fmt_string.format(hvd_rank)
   else:
     input_filename = None
