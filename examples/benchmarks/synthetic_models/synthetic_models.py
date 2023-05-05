@@ -132,10 +132,10 @@ class InputGenerator(keras.utils.Sequence):
         with tf.device(embedding_device):
           max_hotness = hotness
           if mean_hotness_ratio < 1:
-            #min_hotness = 0
-            #mean_hotness = hotness * mean_hotness_ratio
-            min_hotness = 1
-            mean_hotness = min_hotness + hotness * mean_hotness_ratio
+            min_hotness = 0
+            mean_hotness = hotness * mean_hotness_ratio
+            #min_hotness = 1
+            #mean_hotness = min_hotness + hotness * mean_hotness_ratio
           else:
             min_hotness = hotness
             mean_hotness = hotness
@@ -176,13 +176,15 @@ class SyntheticModelTFDE(keras.Model):  # pylint: disable=abstract-method
     embedding_layers = []
     self.input_table_map = []
     embed_count = 0
+    embedding_output_size = 0
     for config in model_config.embedding_configs:
       if len(config.nnz) > 1 and not config.shared:
         raise NotImplementedError("Nonshared multihot embedding is not implemented yet")
 
       for _ in range(config.num_tables):
-        embedding_layers.append(Embedding(config.num_rows, config.width, combiner='sum'))
+        embedding_layers.append(Embedding(config.num_rows, config.width, combiner=model_config.combiner))
         for _ in range(len(config.nnz)):
+          embedding_output_size += config.width
           self.input_table_map.append(embed_count)
         embed_count += 1
     logging.info("%d embedding tables created.", embed_count)
@@ -200,6 +202,18 @@ class SyntheticModelTFDE(keras.Model):  # pylint: disable=abstract-method
     else:
       self.interact = None  # use concatenation
 
+    if model_config.cross_params is not None:
+      self.num_crosses = model_config.cross_params[0]
+      projection_ratio = model_config.cross_params[1]
+      projection_dim = embedding_output_size // projection_ratio
+      if self.num_crosses > 0:
+        self.cross = tfrs.layers.dcn.Cross(projection_dim=projection_dim, use_bias=True)
+      else:
+        self.cross = None
+    else:
+      self.cross = None
+
+
     # Create MLP
     self.mlp = keras.Sequential()
     for size in model_config.mlp_sizes:
@@ -215,10 +229,13 @@ class SyntheticModelTFDE(keras.Model):  # pylint: disable=abstract-method
     if self.interact is not None:
       x = [tf.squeeze(self.interact(tf.expand_dims(tf.concat(x, 1), axis=0)))]
     x = tf.concat(x + [numerical_features], 1)
-
+    if self.cross is not None:
+      crosses = self.cross(x,x)
+      for _ in range(self.num_crosses - 1):
+        crosses = self.cross(x, crosses) 
+      x = crosses
     x = self.mlp(x)
     return x
-
 
 class SyntheticModelNative(keras.Model):  # pylint: disable=abstract-method
   """Main synthetic model class
@@ -238,6 +255,7 @@ class SyntheticModelNative(keras.Model):  # pylint: disable=abstract-method
     self.embeddings = []
     self.input_table_map = []
     embed_count = 0
+    embedding_output_size = 0
     for config in model_config.embedding_configs:
       if len(config.nnz) > 1 and not config.shared:
         raise NotImplementedError("Nonshared multihot embedding is not implemented yet")
@@ -245,6 +263,7 @@ class SyntheticModelNative(keras.Model):  # pylint: disable=abstract-method
       for _ in range(config.num_tables):
         self.embeddings.append(tf.keras.layers.Embedding(config.num_rows, config.width))
         for _ in range(len(config.nnz)):
+          embedding_output_size += config.width
           self.input_table_map.append(embed_count)
         embed_count += 1
     logging.info("%d embedding tables created.", embed_count)
@@ -256,6 +275,18 @@ class SyntheticModelNative(keras.Model):  # pylint: disable=abstract-method
                                                     data_format='channels_first')
     else:
       self.interact = None  # use concatenation
+
+
+    if model_config.cross_params is not None:
+      self.num_crosses = model_config.cross_params[0]
+      projection_ratio = model_config.cross_params[1]
+      projection_dim = embedding_output_size // projection_ratio
+      if self.num_crosses > 0:
+        self.cross = tfrs.layers.dcn.Cross(projection_dim=projection_dim, use_bias=True)
+      else:
+        self.cross = None
+    else:
+      self.cross = None
 
     # Create MLP
     self.mlp = keras.Sequential()
@@ -273,6 +304,11 @@ class SyntheticModelNative(keras.Model):  # pylint: disable=abstract-method
     if self.interact is not None:
       x = [tf.squeeze(self.interact(tf.expand_dims(tf.concat(x, 1), axis=0)))]
     x = tf.concat(x + [numerical_features], 1)
+    if self.cross is not None:
+      crosses = self.cross(x,x)
+      for _ in range(self.num_crosses - 1):
+        crosses = self.cross(x, crosses) 
+      x = crosses
 
     x = self.mlp(x)
     return x

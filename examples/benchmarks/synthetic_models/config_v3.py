@@ -25,7 +25,7 @@ EmbeddingConfig = namedtuple("EmbeddingConfig",
 # interact_stride is stride of 1d pooling which is used emulate memory limited interaction/FM
 ModelConfig = namedtuple(
     "ModelConfig",
-    ["name", "embedding_configs", "mlp_sizes", "num_numerical_features", "interact_stride"])
+    ["name", "embedding_configs", "mlp_sizes", "num_numerical_features", "interact_stride", "combiner", "cross_params"])
 
 model_tiny = ModelConfig(name="Tiny V3",
                          embedding_configs=[
@@ -41,7 +41,9 @@ model_tiny = ModelConfig(name="Tiny V3",
                          ],
                          mlp_sizes=[256, 128],
                          num_numerical_features=10,
-                         interact_stride=None)
+                         interact_stride=None,
+                         combiner='sum',
+                         cross_params=None)
 
 model_small = ModelConfig(name="Small V3",
                           embedding_configs=[
@@ -57,7 +59,9 @@ model_small = ModelConfig(name="Small V3",
                           ],
                           mlp_sizes=[512, 256, 128],
                           num_numerical_features=10,
-                          interact_stride=None)
+                          interact_stride=None,
+                          combiner='sum',
+                          cross_params=None)
 
 model_medium = ModelConfig(name="Medium v3",
                            embedding_configs=[
@@ -73,7 +77,9 @@ model_medium = ModelConfig(name="Medium v3",
                            ],
                            mlp_sizes=[1024, 512, 256, 128],
                            num_numerical_features=25,
-                           interact_stride=7)
+                           interact_stride=7,
+                           combiner='sum',
+                           cross_params=None)
 
 model_large = ModelConfig(name="Large v3",
                           embedding_configs=[
@@ -89,7 +95,9 @@ model_large = ModelConfig(name="Large v3",
                           ],
                           mlp_sizes=[2048, 1024, 512, 256],
                           num_numerical_features=100,
-                          interact_stride=8)
+                          interact_stride=8,
+                          combiner='sum',
+                          cross_params=None)
 
 model_jumbo = ModelConfig(name="Jumbo v3",
                           embedding_configs=[
@@ -105,7 +113,9 @@ model_jumbo = ModelConfig(name="Jumbo v3",
                           ],
                           mlp_sizes=[2048, 1024, 512, 256],
                           num_numerical_features=200,
-                          interact_stride=20)
+                          interact_stride=20,
+                          combiner='sum',
+                          cross_params=None)
 
 model_colossal = ModelConfig(name="Colossal v3",
                              embedding_configs=[
@@ -121,7 +131,9 @@ model_colossal = ModelConfig(name="Colossal v3",
                              ],
                              mlp_sizes=[4096, 2048, 1024, 512, 256],
                              num_numerical_features=500,
-                             interact_stride=30)
+                             interact_stride=30,
+                             combiner='sum',
+                             cross_params=None)
 
 model_criteo = ModelConfig(name="Criteo-dlrm-like",
                            embedding_configs=[
@@ -129,7 +141,9 @@ model_criteo = ModelConfig(name="Criteo-dlrm-like",
                            ],
                            mlp_sizes=[512, 256, 128],
                            num_numerical_features=13,
-                           interact_stride=None)
+                           interact_stride=None,
+                           combiner='sum',
+                           cross_params=None)
 
 synthetic_models_v3 = {
     "criteo": model_criteo,
