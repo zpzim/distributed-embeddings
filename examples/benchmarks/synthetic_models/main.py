@@ -27,6 +27,8 @@ from tensorflow.keras import mixed_precision
 import horovod.tensorflow.keras as hvd
 
 from config_v3 import synthetic_models_v3
+from config_v3 import generate_custom_config
+
 from synthetic_models import SyntheticModelTFDE, SyntheticModelNative, InputGenerator
 
 from distributed_embeddings.python.layers import dist_model_parallel as dmp
@@ -48,7 +50,14 @@ flags.DEFINE_string("embedding_device", "/GPU:0", help="device to place embeddin
 flags.DEFINE_enum("embedding_api", "tfde", ["native", "tfde"], help="embedding to use.")
 flags.DEFINE_bool("amp", False, help="Use mixed precision")
 flags.DEFINE_float("mean_dynamic_hotness_ratio", 1.0, help="For enabling dynamic hot input. Ratio of nnz to set the average hotness of data generated for a particular feature. Set between [0,1]") 
+flags.DEFINE_string("nnzfile", None, help="See config_v3.py for information on the format of this file.")
+flags.DEFINE_string("modelconfig", None, help="See config_v3.py for information on the format of this file.")
 flags.DEFINE_string('input_file_fmt_string', None, help='Specifies the format string for the input file path. e.g. data/train_{0}.pkl, If specified uses data from the input file rather than randomly generating.')
+flags.DEFINE_list('custom_mlp_sizes', [256, 128], help='Size of mlp layers for custom model')
+flags.DEFINE_integer('custom_numeric_features', 1, help='Number of numeric features for a custom model')
+flags.DEFINE_integer('custom_interact_stride', None, help='Interact stride for custom model.')
+flags.DEFINE_list('custom_cross_params', None, help='Cross params for custom model.')
+flags.DEFINE_string('custom_combiner', 'sum', help='Combiner for custom model.')
 # yapf: enable
 # pylint: enable=line-too-long
 
@@ -71,7 +80,24 @@ def main(_):
   if FLAGS.batch_size % hvd_size != 0:
     raise ValueError(F"Batch size ({FLAGS.batch_size}) is not divisible by world size ({hvd_size})")
 
-  model_config = synthetic_models_v3[FLAGS.model]
+
+  if FLAGS.modelconfig and FLAGS.nnzfile:
+    custom_cross_params = None
+    if FLAGS.custom_cross_params is not None and len(FLAGS.custom_cross_params) == 2:
+      custom_cross_params = [int(FLAGS.custom_cross_params[0]), float(FLAGS.custom_cross_params[1])]
+    elif FLAGS.custom_cross_params is not None:
+      raise ValueError("custom_cross_params must contain a list of two values, first value represents number of layers, second value represents the size of the projection dimension as a fraction of the input size")
+    mlp_sizes = None
+    if FLAGS.custom_mlp_sizes:
+      mlp_sizes = []
+      for elem in FLAGS.custom_mlp_sizes:
+        mlp_sizes.append(int(elem))
+    model_config, table_to_features_map = generate_custom_config(FLAGS.modelconfig, FLAGS.nnzfile, mlp_sizes, FLAGS.custom_numeric_features, FLAGS.custom_interact_stride, FLAGS.custom_combiner, custom_cross_params)
+  else:
+    model_config = synthetic_models_v3[FLAGS.model]
+  if hvd_rank == 0:
+    for embedding_config in model_config.embedding_configs:
+      print(embedding_config)
   if FLAGS.embedding_api == "tfde":
     if FLAGS.embedding_device != "/GPU:0":
       raise ValueError(

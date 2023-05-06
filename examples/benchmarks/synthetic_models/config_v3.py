@@ -14,6 +14,8 @@
 # limitations under the License.
 """synthetic model configs"""
 
+import pickle
+
 from collections import namedtuple
 
 # nnz is a list of integer(s). If not shared total number of embedding tables will
@@ -26,6 +28,39 @@ EmbeddingConfig = namedtuple("EmbeddingConfig",
 ModelConfig = namedtuple(
     "ModelConfig",
     ["name", "embedding_configs", "mlp_sizes", "num_numerical_features", "interact_stride", "combiner", "cross_params"])
+
+def generate_custom_config(modelconfig, nnzfile, mlp_sizes, num_numerical_features, interact_stride, combiner, cross_params):
+
+  # Load input shapes from pickle
+  # Input shapes contains several lists which contain the embedding table information
+  # 'table_info' contains the vocab size and embedding dimension for each table
+  # 'table_to_input_mapping' maps each table_id to the list of input_ids that share it.
+  with open(modelconfig,'rb') as f:
+      input_shapes = pickle.load(f)
+
+  # Maps each input id to its corresponding table and nnz info
+  # Mapping looks like:
+  # input_id -> (table_id, max_nnz, min_nnz, mean_nnz)
+  with open(nnzfile, 'rb') as f:
+      max_nnz_dict = pickle.load(f)
+
+  embedding_data = input_shapes['table_info']
+  table_to_input_mapping = input_shapes['table_to_input_mapping']
+
+  embedding_configs = []
+  slots_per_table = []
+  for i, embedding_info in enumerate(embedding_data):
+    nnz_per_slot_for_table = []
+    embedding_vocab = embedding_info[0]
+    embedding_dim = embedding_info[1]
+    slots = []
+    for j, input_id in enumerate(table_to_input_mapping[i]):
+      nnz_per_slot_for_table.append(max_nnz_dict[input_id][1])
+      slots.append(max_nnz_dict[input_id][0])
+    slots_per_table.append(slots)
+    embedding_configs.append(EmbeddingConfig(1,  nnz_per_slot_for_table, embedding_vocab, embedding_dim, True)) 
+  custom_config = ModelConfig(name="Custom", embedding_configs=embedding_configs, mlp_sizes=mlp_sizes, num_numerical_features=num_numerical_features, interact_stride=interact_stride, combiner=combiner, cross_params=cross_params)
+  return custom_config, slots_per_table
 
 model_tiny = ModelConfig(name="Tiny V3",
                          embedding_configs=[
