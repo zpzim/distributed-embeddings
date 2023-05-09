@@ -19,10 +19,12 @@ from time import time
 
 from absl import app
 from absl import flags
+import numpy as np
 
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import mixed_precision
+from tensorflow.python.ops.ragged import ragged_tensor
 
 import horovod.tensorflow.keras as hvd
 
@@ -34,6 +36,7 @@ from synthetic_models import SyntheticModelTFDE, SyntheticModelNative, InputGene
 from distributed_embeddings.python.layers import dist_model_parallel as dmp
 
 os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=fusible'
+np.set_printoptions(precision=3, suppress=True)
 
 # pylint: disable=line-too-long
 # yapf: disable
@@ -56,7 +59,10 @@ flags.DEFINE_string('input_file_fmt_string', None, help='Specifies the format st
 flags.DEFINE_list('custom_mlp_sizes', [256, 128], help='Size of mlp layers for custom model')
 flags.DEFINE_integer('custom_numeric_features', 1, help='Number of numeric features for a custom model')
 flags.DEFINE_integer('custom_interact_stride', None, help='Interact stride for custom model.')
-flags.DEFINE_list('custom_cross_params', None, help='Cross params for custom model.')
+flags.DEFINE_integer('custom_cross_count', None, help='Number of DCN crosses for custom model.')
+flags.DEFINE_string('custom_cross_activation', None, help='Preactivation for DCN crosses for custom model. e.g. relu or tanh.')
+flags.DEFINE_float('custom_cross_projection', 1.0, help='Size of the DCN projection dimension as a fraction of the input size.')
+flags.DEFINE_bool('custom_cross_use_bias', False, help='Whether to use bias for the DCN crosses in custom model.')
 flags.DEFINE_string('custom_combiner', 'sum', help='Combiner for custom model.')
 # yapf: enable
 # pylint: enable=line-too-long
@@ -83,10 +89,12 @@ def main(_):
 
   if FLAGS.modelconfig and FLAGS.nnzfile:
     custom_cross_params = None
-    if FLAGS.custom_cross_params is not None and len(FLAGS.custom_cross_params) == 2:
-      custom_cross_params = [int(FLAGS.custom_cross_params[0]), float(FLAGS.custom_cross_params[1])]
-    elif FLAGS.custom_cross_params is not None:
-      raise ValueError("custom_cross_params must contain a list of two values, first value represents number of layers, second value represents the size of the projection dimension as a fraction of the input size")
+    if FLAGS.custom_cross_count is not None:
+      num_crosses = FLAGS.custom_cross_count
+      proj = FLAGS.custom_cross_projection
+      bias = FLAGS.custom_cross_use_bias
+      activation = FLAGS.custom_cross_activation
+      custom_cross_params = [num_crosses, proj, bias, activation]
     mlp_sizes = None
     if FLAGS.custom_mlp_sizes:
       mlp_sizes = []
@@ -95,6 +103,19 @@ def main(_):
     model_config, table_to_features_map = generate_custom_config(FLAGS.modelconfig, FLAGS.nnzfile, mlp_sizes, FLAGS.custom_numeric_features, FLAGS.custom_interact_stride, FLAGS.custom_combiner, custom_cross_params)
   else:
     model_config = synthetic_models_v3[FLAGS.model]
+    feat_id = 0
+    table_id = 0
+    table_to_features_map = []
+    for conf in model_config.embedding_configs:
+      for table in range(conf.num_tables):
+        feats = []
+        for nnz in conf.nnz:
+          feats.append(feat_id)
+          feat_id += 1
+        table_to_features_map.append(feats)
+        table_id += 1
+  if hvd_rank == 0:
+    print(f'Tables to features: {table_to_features_map}')
   if hvd_rank == 0:
     for embedding_config in model_config.embedding_configs:
       print(embedding_config)
@@ -173,13 +194,33 @@ def main(_):
   # printing initial loss here to force sync before we start timer
   print(F"Initial loss: {loss:.3f}")
 
+  strategy = model.get_embedding_strategy()
+
+  if hvd_rank == 0:
+    print(f'Embedding strategy: {strategy}')
+  lookups_per_feature = None
+  sharded_lookups_per_feature = None
+
   start = time()
   # Input data consumes a lot of memory. Instead of generating num_steps batch of synthetic data,
   # We generate smaller amount of data and loop over them
   for step in range(FLAGS.num_steps):
     inputs = input_gen[step % FLAGS.num_data_batches]
     (numerical_features, cat_features), labels = inputs
+    if lookups_per_feature is None:
+      lookups_per_feature = np.zeros(shape=(len(cat_features),), dtype=np.int64)
+    for i, inp in enumerate(cat_features):
+      if isinstance(inp, ragged_tensor.RaggedTensor):
+        lookups_per_feature[i] += len(inp.values)
+      else:
+        lookups_per_feature[i] += tf.size(inp, out_type=tf.int64)
     loss = train_step(numerical_features, cat_features, labels)
+    #print(sharded_lookups_per_feature.shape)
+    #print(lookup_info.shape)
+    #if sharded_lookups_per_feature is None:
+    #  sharded_lookups_per_feature = lookup_info
+    #else:
+    #  sharded_lookups_per_feature += lookup_info
     if step % 50 == 0:
       loss = hvd.allreduce(loss, name="mean_loss", op=hvd.Average)
       if hvd_rank == 0:
@@ -192,6 +233,33 @@ def main(_):
     print(F"loss: {loss:.3f}")
     stop = time()
     print(F"Iteration time: {(stop - start) * 1000 / FLAGS.num_steps:.3f} ms")
+  #lookups_this_device = tf.math.reduce_sum(sharded_lookups_per_feature, keepdims=True)
+  #lookups_each_device = hvd.allgather(lookups_this_device, name="get_lookups_per_device")
+  lookups_per_feature = hvd.allreduce(lookups_per_feature, name="get_num_lookups_per_feature", op=hvd.Sum)
+
+  total_samples = FLAGS.num_steps * FLAGS.num_data_batches * FLAGS.batch_size
+  if hvd_rank == 0:
+    total_input_lookups = tf.math.reduce_sum(lookups_per_feature)
+    #total_lookups = tf.math.reduce_sum(lookups_each_device)
+    print(f"Avg lookups per sample (before sharding): across all devices {total_input_lookups / total_samples}")
+    #print(f"Avg lookups per sample (inc sharded lookups): across all devices {total_lookups / total_samples}")
+    #lookup_ratio_per_device = tf.cast(lookups_each_device, tf.float64) / tf.cast(total_lookups, tf.float64)
+    #print(f'Avg lookups per sample on each device (inc sharded lookups): {lookups_each_device / total_samples}')
+    #print(f'Share of total lookups on each device (inc sharded lookups): {lookup_ratio_per_device}')
+    print(F"Avg lookups per feature per sample (before sharding): {lookups_per_feature / total_samples}")
+    if table_to_features_map is not None:
+      num_tables = len(model_config.embedding_configs)
+      lookups_per_table = []
+      for feats in table_to_features_map:
+        lookups_for_table = 0
+        for feat in feats:
+          if feat < len(lookups_per_feature):
+            lookups_for_table += lookups_per_feature[feat]
+        lookups_per_table.append(lookups_for_table)
+      #lookups_per_table = [sum(lookups_per_feature[table_to_features_map[i]]) for i in range(num_tables)]
+      lookups_per_table = np.array(lookups_per_table)
+      lookups_per_table_per_sample = lookups_per_table / total_samples
+      print(F"Avg lookups per table per sample (before sharding): {lookups_per_table / total_samples}")
 
 
 if __name__ == '__main__':

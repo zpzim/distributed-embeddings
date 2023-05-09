@@ -199,9 +199,7 @@ class InputGenerator(keras.utils.Sequence):
           max_hotness = hotness
           if mean_hotness_ratio < 1:
             min_hotness = 0
-            mean_hotness = hotness * mean_hotness_ratio
-            #min_hotness = 1
-            #mean_hotness = min_hotness + hotness * mean_hotness_ratio
+            mean_hotness = max(hotness * mean_hotness_ratio, min_hotness)
           else:
             min_hotness = hotness
             mean_hotness = hotness
@@ -271,9 +269,12 @@ class SyntheticModelTFDE(keras.Model):  # pylint: disable=abstract-method
     if model_config.cross_params is not None:
       self.num_crosses = model_config.cross_params[0]
       projection_ratio = model_config.cross_params[1]
+      use_bias = model_config.cross_params[2]
+      preactivation = model_config.cross_params[3]
+
       projection_dim = embedding_output_size // projection_ratio
       if self.num_crosses > 0:
-        self.cross = tfrs.layers.dcn.Cross(projection_dim=projection_dim, use_bias=True)
+        self.cross = tfrs.layers.dcn.Cross(projection_dim=projection_dim, use_bias=use_bias, preactivation=preactivation)
       else:
         self.cross = None
     else:
@@ -296,12 +297,17 @@ class SyntheticModelTFDE(keras.Model):  # pylint: disable=abstract-method
       x = [tf.squeeze(self.interact(tf.expand_dims(tf.concat(x, 1), axis=0)))]
     x = tf.concat(x + [numerical_features], 1)
     if self.cross is not None:
-      crosses = self.cross(x,x)
+      crosses = []
+      crosses.append(self.cross(x,x))
+
       for _ in range(self.num_crosses - 1):
-        crosses = self.cross(x, crosses) 
-      x = crosses
+        crosses.append(self.cross(x, crosses[-1])) 
+      x = crosses[-1]
     x = self.mlp(x)
     return x
+
+  def get_embedding_strategy(self):
+    return self.embeddings.strategy
 
 class SyntheticModelNative(keras.Model):  # pylint: disable=abstract-method
   """Main synthetic model class
