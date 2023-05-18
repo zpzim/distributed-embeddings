@@ -29,7 +29,6 @@ import horovod.tensorflow as hvd
 from distributed_embeddings.python.layers.embedding import Embedding
 from distributed_embeddings.python.layers import dist_model_parallel as dmp
 
-tf.random.set_seed(12345)
 rng = np.random.default_rng(12345)
 
 # pylint: disable=missing-type-doc
@@ -246,7 +245,7 @@ class SyntheticModelTFDE(keras.Model):  # pylint: disable=abstract-method
         raise NotImplementedError("Nonshared multihot embedding is not implemented yet")
 
       for _ in range(config.num_tables):
-        embedding_layers.append(Embedding(config.num_rows, config.width, combiner=model_config.combiner))
+        embedding_layers.append(Embedding(config.num_rows, config.width, combiner=model_config.combiner, lookup_frequency=config.lookup_frequency))
         for _ in range(len(config.nnz)):
           embedding_output_size += config.width
           self.input_table_map.append(embed_count)

@@ -19,12 +19,16 @@ from time import time
 
 from absl import app
 from absl import flags
+from absl import logging
 import numpy as np
+import pickle
 
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import mixed_precision
 from tensorflow.python.ops.ragged import ragged_tensor
+
+tf.keras.utils.set_random_seed(12345)
 
 import horovod.tensorflow.keras as hvd
 
@@ -37,6 +41,7 @@ from distributed_embeddings.python.layers import dist_model_parallel as dmp
 
 os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=fusible'
 np.set_printoptions(precision=3, suppress=True)
+
 
 # pylint: disable=line-too-long
 # yapf: disable
@@ -64,6 +69,8 @@ flags.DEFINE_string('custom_cross_activation', None, help='Preactivation for DCN
 flags.DEFINE_float('custom_cross_projection', 1.0, help='Size of the DCN projection dimension as a fraction of the input size.')
 flags.DEFINE_bool('custom_cross_use_bias', False, help='Whether to use bias for the DCN crosses in custom model.')
 flags.DEFINE_string('custom_combiner', 'sum', help='Combiner for custom model.')
+flags.DEFINE_string('lookups_file', None, help='File with lookup frequency info.')
+flags.DEFINE_bool('dump_lookups', False, help='Whether to dump the lookup frequency per table after the run.')
 # yapf: enable
 # pylint: enable=line-too-long
 
@@ -100,7 +107,7 @@ def main(_):
       mlp_sizes = []
       for elem in FLAGS.custom_mlp_sizes:
         mlp_sizes.append(int(elem))
-    model_config, table_to_features_map = generate_custom_config(FLAGS.modelconfig, FLAGS.nnzfile, mlp_sizes, FLAGS.custom_numeric_features, FLAGS.custom_interact_stride, FLAGS.custom_combiner, custom_cross_params)
+    model_config, table_to_features_map = generate_custom_config(FLAGS.modelconfig, FLAGS.nnzfile, mlp_sizes, FLAGS.custom_numeric_features, FLAGS.custom_interact_stride, FLAGS.custom_combiner, custom_cross_params, FLAGS.lookups_file)
   else:
     model_config = synthetic_models_v3[FLAGS.model]
     feat_id = 0
@@ -141,6 +148,8 @@ def main(_):
     input_filename = FLAGS.input_file_fmt_string.format(hvd_rank)
   else:
     input_filename = None
+  if hvd_rank == 0:
+    print(F"Construct input gen")
   input_gen = InputGenerator(model_config,
                              FLAGS.batch_size,
                              alpha=FLAGS.alpha,
@@ -149,6 +158,8 @@ def main(_):
                              input_filename=input_filename,
                              embedding_device=FLAGS.embedding_device,
                              mean_hotness_ratio=FLAGS.mean_dynamic_hotness_ratio)
+  if hvd_rank == 0:
+    print(F"Constructed input gen")
 
   if FLAGS.optimizer == "sgd":
     optimizer = tf.keras.optimizers.SGD(learning_rate=0.03, momentum=0)
@@ -170,9 +181,13 @@ def main(_):
               verbose=1 if hvd_rank == 0 else 0)
     return
 
+  if hvd_rank == 0:
+    print(F"Gen input")
   # Not using model.fit() api. benchmark custom loop below
   # Run one step to init
   (numerical_features, cat_features), labels = input_gen[-1]
+  if hvd_rank == 0:
+    print(F"First model step")
   model((numerical_features, cat_features))
   dmp.broadcast_variables(model.variables, root_rank=0)
 
@@ -185,7 +200,9 @@ def main(_):
     gradients = tape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(gradients, model.trainable_variables))
     return loss
-
+  if hvd_rank == 0:
+    print(F"Warm up.")
+  model((numerical_features, cat_features))
   # Run 5 steps to compile and warm up
   (numerical_features, cat_features), labels = input_gen[-1]
   for _ in range(5):
@@ -196,12 +213,12 @@ def main(_):
 
   strategy = model.get_embedding_strategy()
 
-  if hvd_rank == 0:
-    print(f'Embedding strategy: {strategy}')
   lookups_per_feature = None
   sharded_lookups_per_feature = None
 
   start = time()
+  if hvd_rank == 0:
+    logging.info("Starting benchmark steps...")
   # Input data consumes a lot of memory. Instead of generating num_steps batch of synthetic data,
   # We generate smaller amount of data and loop over them
   for step in range(FLAGS.num_steps):
@@ -215,12 +232,6 @@ def main(_):
       else:
         lookups_per_feature[i] += tf.size(inp, out_type=tf.int64)
     loss = train_step(numerical_features, cat_features, labels)
-    #print(sharded_lookups_per_feature.shape)
-    #print(lookup_info.shape)
-    #if sharded_lookups_per_feature is None:
-    #  sharded_lookups_per_feature = lookup_info
-    #else:
-    #  sharded_lookups_per_feature += lookup_info
     if step % 50 == 0:
       loss = hvd.allreduce(loss, name="mean_loss", op=hvd.Average)
       if hvd_rank == 0:
@@ -233,19 +244,20 @@ def main(_):
     print(F"loss: {loss:.3f}")
     stop = time()
     print(F"Iteration time: {(stop - start) * 1000 / FLAGS.num_steps:.3f} ms")
-  #lookups_this_device = tf.math.reduce_sum(sharded_lookups_per_feature, keepdims=True)
-  #lookups_each_device = hvd.allgather(lookups_this_device, name="get_lookups_per_device")
+
   lookups_per_feature = hvd.allreduce(lookups_per_feature, name="get_num_lookups_per_feature", op=hvd.Sum)
 
   total_samples = FLAGS.num_steps * FLAGS.num_data_batches * FLAGS.batch_size
+
   if hvd_rank == 0:
     total_input_lookups = tf.math.reduce_sum(lookups_per_feature)
-    #total_lookups = tf.math.reduce_sum(lookups_each_device)
+    lookups_each_device = np.array([sum([lookups_per_feature[feat] for feat in rank]) for rank in strategy.input_ids_list])
+    total_lookups = tf.math.reduce_sum(lookups_each_device)
     print(f"Avg lookups per sample (before sharding): across all devices {total_input_lookups / total_samples}")
-    #print(f"Avg lookups per sample (inc sharded lookups): across all devices {total_lookups / total_samples}")
-    #lookup_ratio_per_device = tf.cast(lookups_each_device, tf.float64) / tf.cast(total_lookups, tf.float64)
-    #print(f'Avg lookups per sample on each device (inc sharded lookups): {lookups_each_device / total_samples}')
-    #print(f'Share of total lookups on each device (inc sharded lookups): {lookup_ratio_per_device}')
+    print(f"Avg lookups per sample (inc sharded lookups): across all devices {total_lookups / total_samples}")
+    lookup_ratio_per_device = tf.cast(lookups_each_device, tf.float64) / tf.cast(total_lookups, tf.float64)
+    print(f'Avg lookups per sample on each device (inc sharded lookups): {lookups_each_device / total_samples}')
+    print(f'Share of total lookups on each device (inc sharded lookups): {lookup_ratio_per_device}')
     print(F"Avg lookups per feature per sample (before sharding): {lookups_per_feature / total_samples}")
     if table_to_features_map is not None:
       num_tables = len(model_config.embedding_configs)
@@ -259,7 +271,10 @@ def main(_):
       #lookups_per_table = [sum(lookups_per_feature[table_to_features_map[i]]) for i in range(num_tables)]
       lookups_per_table = np.array(lookups_per_table)
       lookups_per_table_per_sample = lookups_per_table / total_samples
-      print(F"Avg lookups per table per sample (before sharding): {lookups_per_table / total_samples}")
+      print(F"Avg lookups per table per sample (before sharding): {lookups_per_table_per_sample}")
+      if FLAGS.dump_lookups:
+        with open('lookup_frequency.pkl', 'wb') as f:
+          pickle.dump(lookups_per_table_per_sample.tolist(), f, pickle.HIGHEST_PROTOCOL)
 
 
 if __name__ == '__main__':

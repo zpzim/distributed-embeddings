@@ -67,6 +67,7 @@ class Embedding(tf.keras.layers.Layer):
                activity_regularizer=None,
                embeddings_constraint=None,
                combiner=None,
+               lookup_frequency=None,
                **kwargs):
     if 'input_shape' not in kwargs:
       kwargs['input_shape'] = (None,)
@@ -88,6 +89,7 @@ class Embedding(tf.keras.layers.Layer):
     self.activity_regularizer = regularizers.get(activity_regularizer)
     self.embeddings_constraint = constraints.get(embeddings_constraint)
     self.combiner = combiner
+    self.lookup_frequency = lookup_frequency
 
   @tf_utils.shape_type_conversion
   def build(self, input_shape):  # pylint: disable=unused-argument
@@ -137,7 +139,8 @@ class Embedding(tf.keras.layers.Layer):
         'embeddings_regularizer': regularizers.serialize(self.embeddings_regularizer),
         'activity_regularizer': regularizers.serialize(self.activity_regularizer),
         'embeddings_constraint': constraints.serialize(self.embeddings_constraint),
-        'combiner': self.combiner
+        'combiner': self.combiner,
+        'expected_lookups': self.lookup_frequency
     }
     base_config = super().get_config()
     return dict(list(base_config.items()) + list(config.items()))
@@ -149,6 +152,7 @@ class Embedding(tf.keras.layers.Layer):
     """
     config.pop('mask_zero', None)
     config.pop('input_length', None)
+    config.pop('expected_lookups', None)
     return super().from_config(config)
 
 

@@ -233,10 +233,12 @@ class DistEmbeddingStrategy():
     """
     global_ids = []
     table_sizes = []
+    table_lookup_frequencies = []
     for i, sliced_config in enumerate(sliced_configs):
       for config in sliced_config:
         global_ids.append(i)
         table_sizes.append(config['input_dim'] * config['output_dim'])
+        table_lookup_frequencies.append(config['expected_lookups'])
 
     # Round-robin distribute tables onto workers
     if mode == 'basic':
@@ -248,6 +250,7 @@ class DistEmbeddingStrategy():
           sorted_ids[i::2 * world_size] + sorted_ids[(2 * world_size - 1 - i)::2 * world_size]
           for i in range(world_size)
       ]
+
     # Try to optimize for total memory first. After sorted by size, table are distributed one by one
     # to worker with lowest total size. Memory usage will be more even but table count may not.
     elif mode == 'memory_optimized':
@@ -259,6 +262,36 @@ class DistEmbeddingStrategy():
         res[0][1].append(cur[1])
         res = sorted(res)
       divided_ids = [r[1] for r in res]
+    # Assign equal value to memory usage and lookup frequency when distributing table shards
+    elif mode == 'memory_lookup_balanced':
+      # We z-normalize the table sizes and lookup frequencies, then shift the normalized values so the min
+      # is zero.
+      table_sizes = np.array(table_sizes)
+      table_size_mean = np.mean(table_sizes)
+      table_size_std = np.std(table_sizes)
+      table_sizes_normalized = (table_sizes - table_size_mean) / table_size_std
+      minval = min(table_sizes_normalized)
+      if minval < 0:
+        table_sizes_normalized += abs(minval)
+      table_lookup_frequencies = np.array(table_lookup_frequencies)
+      table_lookup_mean = np.mean(table_lookup_frequencies)
+      table_lookup_std = np.std(table_lookup_frequencies)
+      table_lookup_frequencies_normalized = (table_lookup_frequencies - table_lookup_mean) / table_lookup_std
+      minval = min(table_lookup_frequencies_normalized)
+      if minval < 0:
+        table_lookup_frequencies_normalized += abs(minval)
+      # Compute a weighted score for each table shard, tables which are relatively large and/or have lots of lookups
+      # will be valued higher. The goal is to spread out both the memory usage and lookup frequencies across all chips.
+      weighted_score = table_lookup_frequencies_normalized * 0.5 + table_sizes_normalized * 0.5
+      sorted_pairs = list(sorted(zip(weighted_score, table_sizes, global_ids)))
+      res = [[0, []] for _ in range(world_size)]
+      while sorted_pairs:
+        cur = sorted_pairs.pop()
+        res[0][0] += cur[0]
+        res[0][1].append(cur[2])
+        res = sorted(res)
+      divided_ids = [r[1] for r in res]
+      
     else:
       raise ValueError(F"Unsupported strategy {strategy}")
     return divided_ids
@@ -360,7 +393,7 @@ class DistributedEmbedding(tf.keras.layers.Layer):
                **kwargs):
 
     super().__init__(**kwargs)
-    if strategy not in ['basic', 'memory_balanced', 'memory_optimized']:
+    if strategy not in ['basic', 'memory_balanced', 'memory_optimized', 'memory_lookup_balanced']:
       raise ValueError(F"Unsupported shard strategy {strategy}")
     if row_slice is not None:
       raise NotImplementedError("Row slicing embedding is not supported yet!")
@@ -472,14 +505,6 @@ class DistributedEmbedding(tf.keras.layers.Layer):
       # For ragged input, we need to split the tensor into its CSR component values and row_splits.
       flat_rank_values += rank_values
       flat_row_splits += rank_row_splits
-    if self.rank == 0:
-      print('Strategy: ' , self.strategy.input_ids_list)
-      print('Local Splits Values: ', local_splits_values)
-      print('Local Splits Lengths: ', local_splits_lengths)
-      print('Global Splits Values: ', global_splits_values)
-      print('Global Splits Lengths: ', global_splits_lengths)
-      print('Flat Rank values shape: ', [item.shape for item in flat_rank_values])
-      print('Flat row lengths shape: ', [item.shape for item in flat_row_splits])
     # Concatentate local mp-input across all ranks, for ragged input this includes both values and row_splits. Requiring 2x all-to-all.
     concat_values = tf.concat(flat_rank_values, 0)
     concat_values, values_gathered = hvd.alltoall(concat_values, splits=global_splits_values, name='inp_dp_to_mp_values')
